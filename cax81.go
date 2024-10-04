@@ -3,6 +3,7 @@ package main
 import (
 	"fmt"
 	"log"
+	"net/http"
 	"regexp"
 	"sync"
 	"time"
@@ -198,13 +199,14 @@ func (a *Amplifier) Listen() {
 
 func (a *Amplifier) UpdateState(r *Reply) {
 	a.mu.Lock()
+	defer a.mu.Unlock()
 	switch r.Group {
 	case "02":
 		switch r.Number {
 		case "01":
 			a.powered = r.Data == "1"
 
-			// Powering off resets. the muted state.
+			// Powering off resets the muted state.
 			if !a.powered {
 				a.muted = false
 			}
@@ -216,11 +218,19 @@ func (a *Amplifier) UpdateState(r *Reply) {
 			a.source = sources[r.Data]
 		}
 	}
-	a.mu.Unlock()
+}
+
+// HTTPStatus writes the status as plain text
+func (a *Amplifier) HTTPStatus(w http.ResponseWriter) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	fmt.Fprintf(w, "State: %v, %v, %s\n", a.powered, a.muted, a.source)
 }
 
 func main() {
 	var wg sync.WaitGroup
+
+	mux := http.NewServeMux()
 
 	amp, err := NewAmplifier("/dev/ttyUSB1")
 	if err != nil {
@@ -244,6 +254,11 @@ func main() {
 
 	wg.Add(1)
 	go amp.Listen()
+
+	mux.HandleFunc("/status", func(w http.ResponseWriter, _ *http.Request) {
+		amp.HTTPStatus(w)
+	})
+	log.Fatal(http.ListenAndServe(":8080", mux))
 
 	wg.Wait()
 }
