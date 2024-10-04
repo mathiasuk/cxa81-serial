@@ -4,6 +4,8 @@ import (
 	"fmt"
 	"log"
 	"regexp"
+	"sync"
+	"time"
 
 	"go.bug.st/serial"
 )
@@ -49,6 +51,21 @@ var (
 	GetFirmwareVersion = Command{Group: "13", Number: "02"}
 )
 
+// Sources
+var sources = map[string]string{
+	"00": "A1",
+	"01": "A2",
+	"02": "A3",
+	"03": "A4",
+	"04": "D1",
+	"05": "D2",
+	"06": "D3",
+	"10": "MP3", // CXA81 only
+	"14": "Bluetooth",
+	"16": "USB",
+	"20": "A1 Balanced",
+}
+
 // Reply represents a reply from the CXA amplifier.
 type Reply struct {
 	Group  string
@@ -56,10 +73,11 @@ type Reply struct {
 	Data   string
 }
 
-var validReply = regexp.MustCompile(`^#(\d\d),(\d\d)(?:,(.*))?\r$`)
+var validReply = regexp.MustCompile(`#(\d\d),(\d\d)(?:,([^\r]*))?\r`)
 
 func (r *Reply) String() string {
-	desc := "Unknown reply"
+	desc := fmt.Sprintf("Unknown reply: %s,%s,%s", r.Group, r.Number, r.Data)
+	data := r.Data
 
 	switch r.Group {
 	case "00":
@@ -77,12 +95,13 @@ func (r *Reply) String() string {
 		switch r.Number {
 		case "01":
 			desc = "Current power state"
-		case "02":
+		case "03":
 			desc = "Current mute state"
 		}
 	case "04":
 		if r.Number == "01" {
 			desc = "Current source"
+			data = sources[data]
 		}
 	case "14":
 		switch r.Number {
@@ -103,6 +122,12 @@ func (r *Reply) String() string {
 // Amplifier represents the CXA amplifier and its serial connection.
 type Amplifier struct {
 	port serial.Port
+
+	// State
+	mu      sync.Mutex
+	powered bool
+	muted   bool
+	source  string
 }
 
 // NewAmplifier creates a new Amplifier instance.
@@ -140,79 +165,85 @@ func (a *Amplifier) SendCommand(cmd Command) error {
 }
 
 // Read returns a Reply from the amp.
-func (a *Amplifier) Read() (*Reply, error) {
+func (a *Amplifier) Listen() {
 	buf := make([]byte, 1024)
-	n, err := a.port.Read(buf)
-	if err != nil {
-		return nil, err
-	}
 
-	response := string(buf[:n])
-	matches := validReply.FindStringSubmatch(response)
-	if matches == nil {
-		return nil, fmt.Errorf("invalid reply format: %s", response)
-	}
+	for {
+		n, err := a.port.Read(buf)
+		if err != nil {
+			log.Panicf("Read(): %v", err)
+		}
 
-	reply := &Reply{
-		Group:  matches[1],
-		Number: matches[2],
-	}
-	// If data is present, capture it
-	if len(matches) > 3 {
-		reply.Data = matches[3]
-	}
+		response := string(buf[:n])
+		matches := validReply.FindAllStringSubmatch(response, -1)
+		if matches == nil {
+			log.Panicf("invalid reply format: %q", response)
+		}
 
-	return reply, nil
+		for _, m := range matches {
+			reply := &Reply{
+				Group:  m[1],
+				Number: m[2],
+			}
+			// If data is present, capture it
+			if len(m) > 3 {
+				reply.Data = m[3]
+			}
+			log.Printf("Got: %v", reply)
+			a.UpdateState(reply)
+		}
+		time.Sleep(1 * time.Second)
+	}
+}
+
+func (a *Amplifier) UpdateState(r *Reply) {
+	a.mu.Lock()
+	switch r.Group {
+	case "02":
+		switch r.Number {
+		case "01":
+			a.powered = r.Data == "1"
+
+			// Powering off resets. the muted state.
+			if !a.powered {
+				a.muted = false
+			}
+		case "03":
+			a.muted = r.Data == "1"
+		}
+	case "04":
+		if r.Number == "01" {
+			a.source = sources[r.Data]
+		}
+	}
+	a.mu.Unlock()
 }
 
 func main() {
+	var wg sync.WaitGroup
+
 	amp, err := NewAmplifier("/dev/ttyUSB1")
 	if err != nil {
 		log.Fatal(err)
 	}
 	defer amp.port.Close()
 
-	// Get current power state
+	// Get initial state.
 	err = amp.SendCommand(GetPowerState)
 	if err != nil {
 		log.Fatal(err)
 	}
-	r, err := amp.Read()
+	err = amp.SendCommand(GetMuteState)
 	if err != nil {
 		log.Fatal(err)
 	}
-	log.Printf("Response: %v", r)
-
-	// Get current power state
-	err = amp.SendCommand(SetPowerOn)
-	if err != nil {
-		log.Fatal(err)
-	}
-	r, err = amp.Read()
-	if err != nil {
-		log.Fatal(err)
-	}
-	log.Printf("Response: %v", r)
-
-	// Get current power state
-	err = amp.SendCommand(GetPowerState)
-	if err != nil {
-		log.Fatal(err)
-	}
-	r, err = amp.Read()
-	if err != nil {
-		log.Fatal(err)
-	}
-	log.Printf("Response: %v", r)
-
-	// Get current source
 	err = amp.SendCommand(GetSource)
 	if err != nil {
 		log.Fatal(err)
 	}
-	r, err = amp.Read()
-	if err != nil {
-		log.Fatal(err)
-	}
-	log.Printf("Response: %v", r)
+
+	wg.Add(1)
+	go amp.Listen()
+
+	wg.Wait()
 }
