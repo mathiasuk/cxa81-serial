@@ -1,6 +1,7 @@
 package main
 
 import (
+	"encoding/json"
 	"fmt"
 	"log"
 	"net/http"
@@ -120,15 +121,19 @@ func (r *Reply) String() string {
 	return desc
 }
 
+// AmplifierState represents the internal state of the amplifier.
+type AmplifierState struct {
+	Powered bool
+	Muted   bool
+	Source  string
+}
+
 // Amplifier represents the CXA amplifier and its serial connection.
 type Amplifier struct {
 	port serial.Port
 
-	// State
-	mu      sync.Mutex
-	powered bool
-	muted   bool
-	source  string
+	mu    sync.Mutex
+	state AmplifierState
 }
 
 // NewAmplifier creates a new Amplifier instance.
@@ -204,27 +209,150 @@ func (a *Amplifier) UpdateState(r *Reply) {
 	case "02":
 		switch r.Number {
 		case "01":
-			a.powered = r.Data == "1"
+			a.state.Powered = r.Data == "1"
 
 			// Powering off resets the muted state.
-			if !a.powered {
-				a.muted = false
+			if !a.state.Powered {
+				a.state.Muted = false
 			}
 		case "03":
-			a.muted = r.Data == "1"
+			a.state.Muted = r.Data == "1"
 		}
 	case "04":
 		if r.Number == "01" {
-			a.source = sources[r.Data]
+			a.state.Source = sources[r.Data]
 		}
 	}
 }
 
-// HTTPStatus writes the status as plain text
-func (a *Amplifier) HTTPStatus(w http.ResponseWriter) {
+// HTTPStatus writes the amplifier status.
+func (a *Amplifier) HTTPStatus(w http.ResponseWriter, r *http.Request) {
 	a.mu.Lock()
 	defer a.mu.Unlock()
-	fmt.Fprintf(w, "State: %v, %v, %s\n", a.powered, a.muted, a.source)
+
+	log.Printf("D: %s", r.Method)
+
+	json.NewEncoder(w).Encode(a.state)
+}
+
+// HTTPPower sets the amplifier power state.
+func (a *Amplifier) HTTPPower(w http.ResponseWriter, r *http.Request) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+
+	if r.Method != "POST" {
+		http.Error(w, fmt.Sprintf("Unexpected method: %s", r.Method), http.StatusBadRequest)
+		return
+	}
+
+	var req struct {
+		Power string
+	}
+	err := json.NewDecoder(r.Body).Decode(&req)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+
+	var c Command
+	switch req.Power {
+	case "on":
+		c = SetPowerOn
+	case "off":
+		c = SetPowerStandby
+	case "toggle":
+		if a.state.Powered {
+			c = SetPowerStandby
+		} else {
+			c = SetPowerOn
+		}
+	default:
+		http.Error(w, fmt.Sprintf("Unexpected power state %s, expected: on/off/toggle", req.Power), http.StatusBadRequest)
+	}
+
+	err = a.SendCommand(c)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+	}
+}
+
+// HTTPMute sets the amplifier muted state.
+func (a *Amplifier) HTTPMute(w http.ResponseWriter, r *http.Request) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+
+	if r.Method != "POST" {
+		http.Error(w, fmt.Sprintf("Unexpected method: %s", r.Method), http.StatusBadRequest)
+		return
+	}
+
+	var req struct {
+		Mute bool
+	}
+	err := json.NewDecoder(r.Body).Decode(&req)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+
+	var c Command
+	if req.Mute {
+		c = SetMuteOn
+	} else {
+		c = SetMuteOff
+	}
+
+	err = a.SendCommand(c)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+	}
+}
+
+func (a *Amplifier) HTTPSource(w http.ResponseWriter, r *http.Request) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+
+	var req struct {
+		Source string
+	}
+	err := json.NewDecoder(r.Body).Decode(&req)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+
+	var c Command
+	switch req.Source {
+	case "A1":
+		c = SetSourceA1
+	case "A2":
+		c = SetSourceA2
+	case "A3":
+		c = SetSourceA3
+	case "A4":
+		c = SetSourceA4
+	case "D1":
+		c = SetSourceD1
+	case "D2":
+		c = SetSourceD2
+	case "D3":
+		c = SetSourceD3
+	case "MP3":
+		c = SetSourceMP3
+	case "Bluetooth":
+		c = SetSourceBluetooth
+	case "USB":
+		c = SetSourceUSBAudio
+	case "A1 Balanced":
+		c = SetSourceA1Balanced
+	default:
+		http.Error(w, fmt.Sprintf("Unknown source: %s", req.Source), http.StatusBadRequest)
+	}
+
+	err = a.SendCommand(c)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+	}
 }
 
 func main() {
@@ -255,8 +383,17 @@ func main() {
 	wg.Add(1)
 	go amp.Listen()
 
-	mux.HandleFunc("/status", func(w http.ResponseWriter, _ *http.Request) {
-		amp.HTTPStatus(w)
+	mux.HandleFunc("/status", func(w http.ResponseWriter, r *http.Request) {
+		amp.HTTPStatus(w, r)
+	})
+	mux.HandleFunc("/power", func(w http.ResponseWriter, r *http.Request) {
+		amp.HTTPPower(w, r)
+	})
+	mux.HandleFunc("/muted", func(w http.ResponseWriter, r *http.Request) {
+		amp.HTTPMute(w, r)
+	})
+	mux.HandleFunc("/source", func(w http.ResponseWriter, r *http.Request) {
+		amp.HTTPSource(w, r)
 	})
 	log.Fatal(http.ListenAndServe(":8080", mux))
 
