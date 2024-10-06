@@ -2,6 +2,7 @@ package main
 
 import (
 	"encoding/json"
+	"flag"
 	"fmt"
 	"log"
 	"net/http"
@@ -10,6 +11,12 @@ import (
 	"time"
 
 	"go.bug.st/serial"
+)
+
+var (
+	port = flag.String("port", "/dev/ttyUSB0", "Serial port")
+	user = flag.String("user", "", "HTTP auth username")
+	pwd  = flag.String("pwd", "", "HTTP auth password")
 )
 
 // Command represents a serial command to the CXA amplifier.
@@ -123,9 +130,9 @@ func (r *Reply) String() string {
 
 // AmplifierState represents the internal state of the amplifier.
 type AmplifierState struct {
-	Powered bool
-	Muted   bool
-	Source  string
+	Power  bool   `json:"power"`
+	Mute   bool   `json:"mute"`
+	Source string `json:"source"`
 }
 
 // Amplifier represents the CXA amplifier and its serial connection.
@@ -181,6 +188,7 @@ func (a *Amplifier) Listen() {
 		}
 
 		response := string(buf[:n])
+		log.Printf("Debug: response from amp %q", response)
 		matches := validReply.FindAllStringSubmatch(response, -1)
 		if matches == nil {
 			log.Panicf("invalid reply format: %q", response)
@@ -209,14 +217,15 @@ func (a *Amplifier) UpdateState(r *Reply) {
 	case "02":
 		switch r.Number {
 		case "01":
-			a.state.Powered = r.Data == "1"
+			a.state.Power = r.Data == "1"
 
-			// Powering off resets the muted state.
-			if !a.state.Powered {
-				a.state.Muted = false
+			// Powering off resets the muted and source state.
+			if !a.state.Power {
+				a.state.Mute = false
+				a.state.Source = ""
 			}
 		case "03":
-			a.state.Muted = r.Data == "1"
+			a.state.Mute = r.Data == "1"
 		}
 	case "04":
 		if r.Number == "01" {
@@ -227,7 +236,8 @@ func (a *Amplifier) UpdateState(r *Reply) {
 
 // ServeHTTP serves the amplifier status.
 func (a *Amplifier) ServeHTTP(w http.ResponseWriter, r *http.Request) {
-	// TODO: Auth.
+	// user, pwd, ok := r.BasicAuth()
+	// TODO
 
 	a.mu.Lock()
 	defer a.mu.Unlock()
@@ -243,19 +253,21 @@ func (a *Amplifier) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			http.Error(w, err.Error(), http.StatusBadRequest)
 			return
 		}
+		log.Printf("Request: %v", req)
 		if err := a.handlePower(req.Power); err != nil {
 			http.Error(w, err.Error(), http.StatusInternalServerError)
 		}
 		if err := a.handleMute(req.Mute); err != nil {
 			http.Error(w, err.Error(), http.StatusInternalServerError)
 		}
-		if err := a.handleSource(req.Mute); err != nil {
+		if err := a.handleSource(req.Source); err != nil {
 			http.Error(w, err.Error(), http.StatusInternalServerError)
 		}
 	}
 
 	// GET
 	json.NewEncoder(w).Encode(a.state)
+	log.Printf("Sent state: %v", a.state)
 }
 
 // handlePower updates the power status from the given string.
@@ -268,7 +280,7 @@ func (a *Amplifier) handlePower(s string) error {
 	case "off":
 		c = SetPowerStandby
 	case "toggle":
-		if a.state.Powered {
+		if a.state.Power {
 			c = SetPowerStandby
 		} else {
 			c = SetPowerOn
@@ -336,59 +348,13 @@ func (a *Amplifier) handleSource(s string) error {
 	return a.SendCommand(c)
 }
 
-func (a *Amplifier) HTTPSource(w http.ResponseWriter, r *http.Request) {
-	a.mu.Lock()
-	defer a.mu.Unlock()
-
-	var req struct {
-		Source string
-	}
-	err := json.NewDecoder(r.Body).Decode(&req)
-	if err != nil {
-		http.Error(w, err.Error(), http.StatusBadRequest)
-		return
-	}
-
-	var c Command
-	switch req.Source {
-	case "A1":
-		c = SetSourceA1
-	case "A2":
-		c = SetSourceA2
-	case "A3":
-		c = SetSourceA3
-	case "A4":
-		c = SetSourceA4
-	case "D1":
-		c = SetSourceD1
-	case "D2":
-		c = SetSourceD2
-	case "D3":
-		c = SetSourceD3
-	case "MP3":
-		c = SetSourceMP3
-	case "Bluetooth":
-		c = SetSourceBluetooth
-	case "USB":
-		c = SetSourceUSBAudio
-	case "A1 Balanced":
-		c = SetSourceA1Balanced
-	default:
-		http.Error(w, fmt.Sprintf("Unknown source: %s", req.Source), http.StatusBadRequest)
-	}
-
-	err = a.SendCommand(c)
-	if err != nil {
-		http.Error(w, err.Error(), http.StatusInternalServerError)
-	}
-}
-
 func main() {
 	var wg sync.WaitGroup
 
+	flag.Parse()
 	mux := http.NewServeMux()
 
-	amp, err := NewAmplifier("/dev/ttyUSB1")
+	amp, err := NewAmplifier(*port)
 	if err != nil {
 		log.Fatal(err)
 	}
@@ -413,9 +379,6 @@ func main() {
 
 	mux.Handle("/status", amp)
 
-	mux.HandleFunc("/source", func(w http.ResponseWriter, r *http.Request) {
-		amp.HTTPSource(w, r)
-	})
 	log.Fatal(http.ListenAndServe(":8080", mux))
 
 	wg.Wait()
