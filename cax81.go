@@ -4,11 +4,11 @@ import (
 	"encoding/json"
 	"flag"
 	"fmt"
+	"io"
 	"log"
 	"net/http"
 	"regexp"
 	"sync"
-	"time"
 
 	"go.bug.st/serial"
 )
@@ -137,7 +137,7 @@ type AmplifierState struct {
 
 // Amplifier represents the CXA amplifier and its serial connection.
 type Amplifier struct {
-	port serial.Port
+	port io.ReadWriteCloser
 
 	mu    sync.Mutex
 	state AmplifierState
@@ -177,36 +177,44 @@ func (a *Amplifier) SendCommand(cmd Command) error {
 	return nil
 }
 
-// Read returns a Reply from the amp.
-func (a *Amplifier) Listen() {
+// readUpdate reads from the port and updates the state accordingly.
+func (a *Amplifier) readUpdate() error {
 	buf := make([]byte, 1024)
 
+	n, err := a.port.Read(buf)
+	if err != nil {
+		return err
+	}
+
+	response := string(buf[:n])
+	log.Printf("Debug: response from amp %q", response)
+	matches := validReply.FindAllStringSubmatch(response, -1)
+	if matches == nil {
+		return fmt.Errorf("invalid reply format: %q", response)
+	}
+
+	for _, m := range matches {
+		reply := &Reply{
+			Group:  m[1],
+			Number: m[2],
+		}
+		// If data is present, capture it
+		if len(m) > 3 {
+			reply.Data = m[3]
+		}
+		log.Printf("Received: %v", reply)
+		a.UpdateState(reply)
+	}
+	return nil
+}
+
+// Listen calls readUpdate indefinitely.
+func (a *Amplifier) Listen() {
 	for {
-		n, err := a.port.Read(buf)
-		if err != nil {
-			log.Panicf("Read(): %v", err)
+		if err := a.readUpdate(); err != nil {
+			log.Printf("error, readUpdate(): %v", err)
+			continue
 		}
-
-		response := string(buf[:n])
-		log.Printf("Debug: response from amp %q", response)
-		matches := validReply.FindAllStringSubmatch(response, -1)
-		if matches == nil {
-			log.Panicf("invalid reply format: %q", response)
-		}
-
-		for _, m := range matches {
-			reply := &Reply{
-				Group:  m[1],
-				Number: m[2],
-			}
-			// If data is present, capture it
-			if len(m) > 3 {
-				reply.Data = m[3]
-			}
-			log.Printf("Received: %v", reply)
-			a.UpdateState(reply)
-		}
-		time.Sleep(1 * time.Second)
 	}
 }
 
@@ -277,13 +285,17 @@ func (a *Amplifier) handlePower(s string) error {
 	switch s {
 	case "on":
 		c = SetPowerOn
+		a.state.Power = true
 	case "off":
 		c = SetPowerStandby
+		a.state.Power = false
 	case "toggle":
 		if a.state.Power {
 			c = SetPowerStandby
+			a.state.Power = false
 		} else {
 			c = SetPowerOn
+			a.state.Power = true
 		}
 	case "":
 		return nil
@@ -296,13 +308,18 @@ func (a *Amplifier) handlePower(s string) error {
 
 // handleMute updates the mute status from the given string.
 func (a *Amplifier) handleMute(s string) error {
+	if !a.state.Power {
+		return nil
+	}
 	var c Command
 
 	switch s {
 	case "on", "muted":
 		c = SetMuteOn
+		a.state.Mute = true
 	case "off", "unmuted":
 		c = SetMuteOff
+		a.state.Mute = false
 	case "":
 		return nil
 	default:
@@ -314,31 +331,45 @@ func (a *Amplifier) handleMute(s string) error {
 
 // handleSource updates the source from the given string.
 func (a *Amplifier) handleSource(s string) error {
+	if !a.state.Power {
+		return nil
+	}
 	var c Command
 
 	switch s {
 	case "A1":
 		c = SetSourceA1
+		a.state.Source = "A1"
 	case "A2":
 		c = SetSourceA2
+		a.state.Source = "A2"
 	case "A3":
 		c = SetSourceA3
+		a.state.Source = "A3"
 	case "A4":
 		c = SetSourceA4
+		a.state.Source = "A4"
 	case "D1":
 		c = SetSourceD1
+		a.state.Source = "D1"
 	case "D2":
 		c = SetSourceD2
+		a.state.Source = "D2"
 	case "D3":
 		c = SetSourceD3
+		a.state.Source = "D3"
 	case "MP3":
 		c = SetSourceMP3
+		a.state.Source = "MP3"
 	case "Bluetooth":
 		c = SetSourceBluetooth
+		a.state.Source = "Bluetooth"
 	case "USB":
 		c = SetSourceUSBAudio
+		a.state.Source = "USB"
 	case "A1 Balanced":
 		c = SetSourceA1Balanced
+		a.state.Source = "A1 Balanced"
 	case "":
 		return nil
 	default:
